@@ -1,0 +1,852 @@
+package pgconn
+
+import (
+	"context"
+	"database/sql"
+	"encoding/binary"
+	"fmt"
+	"math"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/yourusername/mysql2pg/internal/config"
+)
+
+// Connection PostgreSQL连接管理器
+type Connection struct {
+	pool   *pgxpool.Pool
+	config *config.PostgreSQLConfig
+}
+
+var charZeroPattern = regexp.MustCompile(`(?i)char\s*\(\s*0\s*\)`)
+var mysqlCollationSuffixTypePattern = regexp.MustCompile(`(?i)(text|longtext|mediumtext|tinytext|varchar\(\d+\)|char\(\d+\))_[a-z0-9_]+(\s|,|\)|$)`)
+
+// NewConnection 创建新的PostgreSQL连接
+func NewConnection(config *config.PostgreSQLConfig) (*Connection, error) {
+	ctx := context.Background()
+
+	// 使用无压缩连接
+	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+		config.Host, config.Port, config.Username, config.Password, config.Database)
+
+	// 添加连接参数
+	if config.PgConnectionParams != "" {
+		connStr += " " + config.PgConnectionParams
+	}
+
+	poolConfig, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		return nil, fmt.Errorf("解析PostgreSQL连接配置失败: %w", err)
+	}
+
+	// 设置连接池大小
+	poolConfig.MaxConns = int32(config.MaxConns) // 使用配置文件中的最大连接数
+
+	// 创建连接池
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		return nil, fmt.Errorf("创建PostgreSQL连接池失败: %w", err)
+	}
+
+	// 测试连接
+	if err := pool.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("PostgreSQL连接测试失败: %w", err)
+	}
+
+	// 尝试初始化 PostGIS 扩展，以支持空间数据类型
+	// 注意：在某些环境中可能没有权限创建扩展，所以这里只尝试，不强制报错
+	_, _ = pool.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS postgis")
+
+	return &Connection{
+		pool:   pool,
+		config: config,
+	}, nil
+}
+
+// Close 关闭连接池
+func (c *Connection) Close() error {
+	c.pool.Close()
+	return nil
+}
+
+// GetPool 获取底层连接池
+func (c *Connection) GetPool() *pgxpool.Pool {
+	return c.pool
+}
+
+// BeginTransaction 开始事务
+func (c *Connection) BeginTransaction(ctx context.Context) (pgx.Tx, error) {
+	return c.pool.Begin(ctx)
+}
+
+// ExecuteDDL 执行DDL语句
+func (c *Connection) ExecuteDDL(ddl string) error {
+	ctx := context.Background()
+	execDDL := sanitizeDDLForExecution(ddl)
+	_, err := c.pool.Exec(ctx, execDDL)
+	if err != nil {
+		return fmt.Errorf("执行DDL失败: %w, PostgreSQL SQL: %s", err, execDDL)
+	}
+	return err
+}
+
+// ExecuteDDLWithTransaction 在事务中执行DDL语句
+func (c *Connection) ExecuteDDLWithTransaction(tx pgx.Tx, ddl string) error {
+	execDDL := sanitizeDDLForExecution(ddl)
+	_, err := tx.Exec(context.Background(), execDDL)
+	return err
+}
+
+func sanitizeDDLForExecution(ddl string) string {
+	ddl = charZeroPattern.ReplaceAllString(ddl, "char(10)")
+	ddl = mysqlCollationSuffixTypePattern.ReplaceAllString(ddl, "$1$2")
+	return ddl
+}
+
+// InsertData 插入数据
+func (c *Connection) InsertData(tableName string, columns []string, rows *sql.Rows) error {
+	ctx := context.Background()
+
+	// 构建占位符模板
+	placeholders := make([]string, len(columns))
+	for i := range placeholders {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+	placeholdersStr := strings.Join(placeholders, ", ")
+
+	// 构建列名字符串（添加双引号以保持大小写）
+	var quotedColumns []string
+	for _, col := range columns {
+		quotedColumns = append(quotedColumns, fmt.Sprintf(`"%s"`, col))
+	}
+	columnsStr := strings.Join(quotedColumns, ", ")
+
+	// 构建插入语句
+	query := fmt.Sprintf("INSERT INTO \"%s\" (%s) VALUES (%s)", tableName, columnsStr, placeholdersStr)
+
+	// 逐行插入数据
+	for rows.Next() {
+		// 创建值切片
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		// 扫描行数据
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return fmt.Errorf("扫描行数据失败: %w", err)
+		}
+
+		// 执行插入
+		_, err := c.pool.Exec(ctx, query, values...)
+		if err != nil {
+			return fmt.Errorf("执行插入失败: %w", err)
+		}
+	}
+
+	return rows.Err()
+}
+
+// InsertDataWithTransaction 在事务中插入数据
+func (c *Connection) InsertDataWithTransaction(tx pgx.Tx, tableName string, columns []string, rows *sql.Rows) error {
+	ctx := context.Background()
+
+	// 构建占位符模板
+	placeholders := make([]string, len(columns))
+	for i := range placeholders {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+	placeholdersStr := strings.Join(placeholders, ", ")
+
+	// 构建列名字符串（添加双引号以保持大小写）
+	var quotedColumns []string
+	for _, col := range columns {
+		quotedColumns = append(quotedColumns, fmt.Sprintf(`"%s"`, col))
+	}
+	columnsStr := strings.Join(quotedColumns, ", ")
+
+	// 构建插入语句
+	query := fmt.Sprintf("INSERT INTO \"%s\" (%s) VALUES (%s)", tableName, columnsStr, placeholdersStr)
+
+	// 逐行插入数据
+	for rows.Next() {
+		// 创建值切片
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		// 扫描行数据
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return fmt.Errorf("扫描行数据失败: %w", err)
+		}
+
+		// 执行插入
+		_, err := tx.Exec(ctx, query, values...)
+		if err != nil {
+			return fmt.Errorf("执行插入失败: %w", err)
+		}
+	}
+
+	return rows.Err()
+}
+
+// BatchInsertDataWithTransaction 在事务中批量插入数据
+func (c *Connection) BatchInsertDataWithTransaction(tx pgx.Tx, tableName string, columns []string, batchSize int, rows *sql.Rows) error {
+	ctx := context.Background()
+
+	// 构建列名字符串
+	var quotedColumns []string
+	for _, col := range columns {
+		quotedColumns = append(quotedColumns, fmt.Sprintf(`"%s"`, col))
+	}
+	columnsStr := strings.Join(quotedColumns, ", ")
+
+	// 准备批量插入
+	var batchValues []interface{}
+	var rowCount int
+
+	// 严格使用传入的batchSize参数，不使用硬编码默认值
+	effectiveBatchSize := batchSize
+	if effectiveBatchSize <= 0 {
+		effectiveBatchSize = 10000 // 确保至少有一个合理的默认值
+	}
+
+	// 预分配切片容量，减少内存分配
+	batchValues = make([]interface{}, 0, effectiveBatchSize*len(columns))
+
+	// 重用values和valuePtrs切片，减少内存分配
+	values := make([]interface{}, len(columns))
+	valuePtrs := make([]interface{}, len(columns))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	// 处理数据行
+	for rows.Next() {
+		// 扫描行数据
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return fmt.Errorf("扫描行数据失败: %w", err)
+		}
+
+		// 添加到批量值中
+		batchValues = append(batchValues, values...)
+		rowCount++
+
+		// 当达到批量大小时执行插入
+		if rowCount == effectiveBatchSize {
+			if err := c.executeBatchInsert(tx, ctx, tableName, columnsStr, columns, batchValues); err != nil {
+				return err
+			}
+			batchValues = batchValues[:0] // 重置切片，保留容量
+			rowCount = 0
+		}
+	}
+
+	// 执行剩余的数据
+	if len(batchValues) > 0 {
+		if err := c.executeBatchInsert(tx, ctx, tableName, columnsStr, columns, batchValues); err != nil {
+			return err
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// executeBatchInsert 执行批量插入操作
+func (c *Connection) executeBatchInsert(tx pgx.Tx, ctx context.Context, tableName, columnsStr string, columns []string, values []interface{}) error {
+	// 计算批次大小，确保总参数数量不超过PostgreSQL的限制(65535)
+	columnCount := len(columns)
+	// 计算每个批次的最大行数，确保总参数数量不超过65535
+	maxRowsPerBatch := 65535 / columnCount
+	if maxRowsPerBatch == 0 {
+		maxRowsPerBatch = 1 // 确保至少有一行
+	}
+
+	// 计算总共有多少行数据
+	totalRows := len(values) / columnCount
+
+	// 分批执行
+	for i := 0; i < totalRows; i += maxRowsPerBatch {
+		end := i + maxRowsPerBatch
+		if end > totalRows {
+			end = totalRows
+		}
+
+		// 计算当前批次的起始和结束索引
+		startIdx := i * columnCount
+		endIdx := end * columnCount
+
+		// 获取当前批次的值
+		batchValues := values[startIdx:endIdx]
+
+		// 构建VALUES部分
+		var valuesParts strings.Builder
+		// 预分配更大的内存
+		valuesParts.Grow((end - i) * (columnCount*4 + 5)) // 增加预分配空间
+
+		// 生成参数占位符
+		for row := 0; row < end-i; row++ {
+			if row > 0 {
+				valuesParts.WriteString(", ")
+			}
+			valuesParts.WriteString("(")
+			for col := 0; col < columnCount; col++ {
+				if col > 0 {
+					valuesParts.WriteString(", ")
+				}
+				valuesParts.WriteString("$")
+				valuesParts.WriteString(strconv.Itoa(row*columnCount + col + 1))
+			}
+			valuesParts.WriteString(")")
+		}
+
+		// 构建完整的SQL语句
+		query := fmt.Sprintf("INSERT INTO \"%s\" (%s) VALUES %s", tableName, columnsStr, valuesParts.String())
+
+		// 执行批量插入
+		_, err := tx.Exec(ctx, query, batchValues...)
+		if err != nil {
+			// 打印错误信息和部分数据样本
+			sampleSize := 5
+			if len(batchValues) < sampleSize {
+				sampleSize = len(batchValues)
+			}
+			var samples []string
+			for j := 0; j < sampleSize; j++ {
+				samples = append(samples, fmt.Sprintf("%v", batchValues[j]))
+			}
+			return fmt.Errorf("批量插入失败: %w, 数据样本: %v", err, samples)
+		}
+	}
+
+	return nil
+}
+
+// GetVersion 获取PostgreSQL版本信息
+func (c *Connection) GetVersion() (string, error) {
+	ctx := context.Background()
+	var version string
+	err := c.pool.QueryRow(ctx, "SELECT version()").Scan(&version)
+	if err != nil {
+		return "", fmt.Errorf("获取PostgreSQL版本失败: %w", err)
+	}
+	return version, nil
+}
+
+// TestConnection 测试PostgreSQL连接
+func TestConnection(config *config.PostgreSQLConfig) error {
+	// 测试连接时不使用压缩
+	conn, err := NewConnection(config)
+	if err != nil {
+		return fmt.Errorf("PostgreSQL连接测试失败: %w", err)
+	}
+	defer conn.Close()
+
+	return nil
+}
+
+// TableExists 检查表是否存在
+func (c *Connection) TableExists(tableName string) (bool, error) {
+	ctx := context.Background()
+	query := `
+		SELECT EXISTS (
+			SELECT 1 
+			FROM information_schema.tables 
+			WHERE table_schema = 'public' 
+			AND table_name = $1
+		)
+	`
+	var exists bool
+	err := c.pool.QueryRow(ctx, query, tableName).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("检查表是否存在失败: %w", err)
+	}
+	return exists, nil
+}
+
+// GrantTablePrivileges 授予表权限
+func (c *Connection) GrantTablePrivileges(user, tableName string, privileges []string) error {
+	ctx := context.Background()
+
+	// 构建权限字符串
+	privilegesStr := strings.Join(privileges, ", ")
+
+	// 构建授权语句
+	query := fmt.Sprintf("GRANT %s ON TABLE \"%s\" TO %s", privilegesStr, tableName, user)
+
+	_, err := c.pool.Exec(ctx, query)
+	if err != nil {
+		return fmt.Errorf("授予表权限失败: %w", err)
+	}
+
+	return nil
+}
+
+// GetTablePrivileges 获取表的权限信息
+func (c *Connection) GetTablePrivileges(tableName string) ([]map[string]string, error) {
+	ctx := context.Background()
+
+	query := `
+		SELECT 
+			grantee::regrole::text AS "user_or_role", 
+			privilege_type, 
+			is_grantable 
+		FROM 
+			information_schema.role_table_grants 
+		WHERE 
+			table_schema = 'public' 
+			AND table_name = $1
+	`
+
+	rows, err := c.pool.Query(ctx, query, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("获取表权限失败: %w", err)
+	}
+	defer rows.Close()
+
+	var privileges []map[string]string
+	for rows.Next() {
+		var user, privilege, isGrantable string
+		if err := rows.Scan(&user, &privilege, &isGrantable); err != nil {
+			return nil, fmt.Errorf("扫描表权限信息失败: %w", err)
+		}
+
+		privileges = append(privileges, map[string]string{
+			"user":         user,
+			"privilege":    privilege,
+			"is_grantable": isGrantable,
+		})
+	}
+
+	return privileges, nil
+}
+
+// GetTableRowCount 获取表的行数
+func (c *Connection) GetTableRowCount(tableName string) (int64, error) {
+	ctx := context.Background()
+	query := fmt.Sprintf("SELECT COUNT(*) FROM \"%s\"", tableName)
+
+	var count int64
+	err := c.pool.QueryRow(ctx, query).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("获取表 %s 行数失败: %w", tableName, err)
+	}
+
+	return count, nil
+}
+
+func getColumnTypeByName(columnName string, columnTypes map[string]string) string {
+	if len(columnTypes) == 0 {
+		return ""
+	}
+	if t, ok := columnTypes[columnName]; ok {
+		return t
+	}
+	for k, v := range columnTypes {
+		if strings.EqualFold(k, columnName) {
+			return v
+		}
+	}
+	return ""
+}
+
+func isBinaryLikeType(columnType string) bool {
+	t := strings.ToLower(columnType)
+	return strings.Contains(t, "blob") || strings.Contains(t, "binary") || strings.Contains(t, "bytea")
+}
+
+func isGeometryLikeType(columnType string) bool {
+	t := strings.ToLower(columnType)
+	return strings.Contains(t, "point") || strings.Contains(t, "geometry") ||
+		strings.Contains(t, "linestring") || strings.Contains(t, "polygon") ||
+		strings.Contains(t, "multipoint") || strings.Contains(t, "multilinestring") ||
+		strings.Contains(t, "multipolygon") || strings.Contains(t, "geometrycollection")
+}
+
+func isDateTimeLikeType(columnType string) bool {
+	t := strings.ToLower(columnType)
+	return strings.Contains(t, "datetime") || strings.Contains(t, "timestamp") ||
+		strings.Contains(t, "date") || strings.Contains(t, "time")
+}
+
+func parseDateTime(val string) (time.Time, bool) {
+	layouts := []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04:05.000000",
+		"2006-01-02",
+		"15:04:05",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, val); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func defaultDateTimeValue(columnType string) interface{} {
+	if strings.Contains(columnType, "time") && !strings.Contains(columnType, "datetime") && !strings.Contains(columnType, "timestamp") {
+		return "00:00:00"
+	}
+	return time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+}
+
+func convertBatchColumnValue(columnName string, value interface{}, columnTypes map[string]string) interface{} {
+	columnType := getColumnTypeByName(columnName, columnTypes)
+	lowerColumnType := strings.ToLower(columnType)
+
+	if value == nil {
+		if isDateTimeLikeType(lowerColumnType) {
+			return defaultDateTimeValue(lowerColumnType)
+		}
+		return nil
+	}
+
+	// 1. 处理 MySQL 的零值日期/时间
+	switch val := value.(type) {
+	case string:
+		if val == "0000-00-00 00:00:00" || val == "0000-00-00" || val == "00:00:00" {
+			if isDateTimeLikeType(lowerColumnType) {
+				return defaultDateTimeValue(lowerColumnType)
+			}
+			return nil
+		}
+	case []byte:
+		sVal := string(val)
+		if sVal == "0000-00-00 00:00:00" || sVal == "0000-00-00" || sVal == "00:00:00" {
+			if isDateTimeLikeType(lowerColumnType) {
+				return defaultDateTimeValue(lowerColumnType)
+			}
+			return nil
+		}
+	case time.Time:
+		if val.IsZero() {
+			if isDateTimeLikeType(lowerColumnType) {
+				return defaultDateTimeValue(lowerColumnType)
+			}
+			return nil
+		}
+	}
+
+	// 2. 根据列类型进行转换
+	if isGeometryLikeType(lowerColumnType) {
+		if b, ok := value.([]byte); ok {
+			// 目前仅支持解析 Point 类型
+			if pointStr, err := parseMySQLPoint(b); err == nil {
+				return pointStr
+			}
+		}
+		// 如果不是 []byte 或解析失败，则返回原始值
+		return value
+	}
+
+	if isBinaryLikeType(lowerColumnType) {
+		return value // pgx 能够处理 []byte 到 BYTEA 的转换
+	}
+
+	// 处理日期时间类型
+	if isDateTimeLikeType(lowerColumnType) {
+		switch v := value.(type) {
+		case time.Time:
+			return v
+		case []byte:
+			sVal := string(v)
+			if t, ok := parseDateTime(sVal); ok {
+				return t
+			}
+			return sVal
+		case string:
+			if t, ok := parseDateTime(v); ok {
+				return t
+			}
+			return v
+		}
+	}
+
+	// 处理 tinyint(1) 作为布尔值
+	if strings.Contains(lowerColumnType, "tinyint(1)") {
+		switch v := value.(type) {
+		case int64:
+			return v != 0
+		case int32:
+			return v != 0
+		case int:
+			return v != 0
+		case []byte:
+			if len(v) > 0 {
+				return v[0] != '0'
+			}
+		case string:
+			return v != "0" && strings.ToLower(v) != "false"
+		case bool:
+			return v
+		}
+	}
+
+	// 3. 通用的 Go 类型处理
+	switch val := value.(type) {
+	case []byte:
+		// 如果不是二进制、空间或时间类型，且是 []byte，通常是字符串表示（如 decimal, json, text）
+		return string(val)
+	case string:
+		return val
+	case time.Time:
+		return val
+	default:
+		return val
+	}
+}
+
+// BatchInsertDataWithTransactionAndGetLastValue 在事务中批量插入数据并获取最后一个主键值
+func resolveCopyColumnsAndPrimaryKey(columns []string, primaryKey string) ([]string, string) {
+	copyColumns := make([]string, len(columns))
+	for i, col := range columns {
+		copyColumns[i] = strings.ToLower(col)
+	}
+	if primaryKey == "" {
+		return copyColumns, ""
+	}
+	lowerPrimaryKey := strings.ToLower(primaryKey)
+	for i, col := range columns {
+		if strings.EqualFold(col, primaryKey) {
+			return copyColumns, copyColumns[i]
+		}
+	}
+	return copyColumns, lowerPrimaryKey
+}
+
+func (c *Connection) BatchInsertDataWithTransactionAndGetLastValue(tx pgx.Tx, tableName string, columns []string, columnTypes map[string]string, batchSize int, primaryKey string, rows *sql.Rows) (int, interface{}, error) {
+	ctx := context.Background()
+
+	// 准备批量插入
+	var rowCount int
+	var totalRows int
+
+	// 严格使用传入的batchSize参数，不使用硬编码默认值
+	effectiveBatchSize := batchSize
+	if effectiveBatchSize <= 0 {
+		effectiveBatchSize = 10000 // 确保至少有一个合理的默认值
+	}
+
+	copyColumns, resolvedPrimaryKey := resolveCopyColumnsAndPrimaryKey(columns, primaryKey)
+
+	// 跟踪最后一个主键值
+	var lastValue interface{}
+	var primaryKeyIndex int = -1
+
+	// 找到主键列的索引
+	if resolvedPrimaryKey != "" {
+		for i, col := range copyColumns {
+			if col == resolvedPrimaryKey {
+				primaryKeyIndex = i
+				break
+			}
+		}
+	}
+
+	// 重用values和valuePtrs切片，减少内存分配
+	values := make([]interface{}, len(columns))
+	valuePtrs := make([]interface{}, len(columns))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	// 使用pgx的CopyFrom函数进行高效批量插入
+	copyRows := make([][]interface{}, 0, effectiveBatchSize)
+
+	// 处理数据行
+	for rows.Next() {
+		// 扫描行数据
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return 0, nil, fmt.Errorf("扫描行数据失败: %w", err)
+		}
+
+		// 跟踪最后一个主键值
+		if primaryKeyIndex != -1 {
+			lastValue = values[primaryKeyIndex]
+		}
+
+		// 复制当前行的值到新的切片并进行类型转换
+		rowValues := make([]interface{}, len(values))
+		for i, v := range values {
+			rowValues[i] = convertBatchColumnValue(columns[i], v, columnTypes)
+		}
+		copyRows = append(copyRows, rowValues)
+
+		rowCount++
+		totalRows++
+
+		// 当达到批量大小时执行CopyFrom
+		if rowCount == effectiveBatchSize {
+			// 执行CopyFrom，使用转换后的小写列名
+			_, err := tx.CopyFrom(ctx, pgx.Identifier{tableName}, copyColumns, pgx.CopyFromRows(copyRows))
+			if err != nil {
+				return 0, nil, fmt.Errorf("CopyFrom执行失败: %w", err)
+			}
+
+			// 重置切片和计数器
+			copyRows = make([][]interface{}, 0, effectiveBatchSize)
+			rowCount = 0
+		}
+	}
+
+	// 执行剩余的数据
+	if rowCount > 0 {
+		// 执行CopyFrom，使用转换后的小写列名
+		_, err := tx.CopyFrom(ctx, pgx.Identifier{tableName}, copyColumns, pgx.CopyFromRows(copyRows))
+		if err != nil {
+			return 0, nil, fmt.Errorf("CopyFrom执行失败: %w", err)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return 0, nil, err
+	}
+
+	// 只有在没有找到主键值的情况下，才执行MAX查询（作为后备方案）
+	if resolvedPrimaryKey != "" && lastValue == nil {
+		query := fmt.Sprintf("SELECT MAX(\"%s\") FROM \"%s\"", resolvedPrimaryKey, tableName)
+		err := tx.QueryRow(ctx, query).Scan(&lastValue)
+		if err != nil && err != pgx.ErrNoRows {
+			return 0, nil, fmt.Errorf("获取最后一个主键值失败: %w", err)
+		}
+	}
+
+	return totalRows, lastValue, nil
+}
+
+func (c *Connection) BatchInsertDataAndGetLastValue(tableName string, columns []string, columnTypes map[string]string, batchSize int, primaryKey string, rows *sql.Rows) (int, interface{}, error) {
+	ctx := context.Background()
+
+	var rowCount int
+	var totalRows int
+
+	effectiveBatchSize := batchSize
+	if effectiveBatchSize <= 0 {
+		effectiveBatchSize = 10000
+	}
+
+	copyColumns, resolvedPrimaryKey := resolveCopyColumnsAndPrimaryKey(columns, primaryKey)
+
+	var lastValue interface{}
+	primaryKeyIndex := -1
+	if resolvedPrimaryKey != "" {
+		for i, col := range copyColumns {
+			if col == resolvedPrimaryKey {
+				primaryKeyIndex = i
+				break
+			}
+		}
+	}
+
+	values := make([]interface{}, len(columns))
+	valuePtrs := make([]interface{}, len(columns))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	copyRows := make([][]interface{}, 0, effectiveBatchSize)
+
+	for rows.Next() {
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return 0, nil, fmt.Errorf("扫描行数据失败: %w", err)
+		}
+
+		if primaryKeyIndex != -1 {
+			lastValue = values[primaryKeyIndex]
+		}
+
+		rowValues := make([]interface{}, len(values))
+		for i, v := range values {
+			rowValues[i] = convertBatchColumnValue(columns[i], v, columnTypes)
+		}
+		copyRows = append(copyRows, rowValues)
+
+		rowCount++
+		totalRows++
+
+		if rowCount == effectiveBatchSize {
+			_, err := c.pool.CopyFrom(ctx, pgx.Identifier{tableName}, copyColumns, pgx.CopyFromRows(copyRows))
+			if err != nil {
+				return 0, nil, fmt.Errorf("CopyFrom执行失败: %w", err)
+			}
+
+			copyRows = make([][]interface{}, 0, effectiveBatchSize)
+			rowCount = 0
+		}
+	}
+
+	if rowCount > 0 {
+		_, err := c.pool.CopyFrom(ctx, pgx.Identifier{tableName}, copyColumns, pgx.CopyFromRows(copyRows))
+		if err != nil {
+			return 0, nil, fmt.Errorf("CopyFrom执行失败: %w", err)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return 0, nil, err
+	}
+
+	if resolvedPrimaryKey != "" && lastValue == nil {
+		query := fmt.Sprintf("SELECT MAX(\"%s\") FROM \"%s\"", resolvedPrimaryKey, tableName)
+		err := c.pool.QueryRow(ctx, query).Scan(&lastValue)
+		if err != nil && err != pgx.ErrNoRows {
+			return 0, nil, fmt.Errorf("获取最后一个主键值失败: %w", err)
+		}
+	}
+
+	return totalRows, lastValue, nil
+}
+
+// parseMySQLPoint 解析MySQL的WKB格式Point数据
+func parseMySQLPoint(data []byte) (string, error) {
+	// MySQL Geometry Header (4 bytes SRID) + WKB (1 byte order + 4 bytes type + 16 bytes coords)
+	// SRID (4) + Order (1) + Type (4) + X (8) + Y (8) = 25 bytes
+	if len(data) != 25 {
+		return "", fmt.Errorf("invalid MySQL point data length: %d", len(data))
+	}
+
+	// Skip SRID (4 bytes)
+	// Byte order (1 byte)
+	order := data[4]
+
+	var x, y float64
+
+	if order == 1 { // Little Endian
+		// Check type (Point = 1)
+		typeCode := binary.LittleEndian.Uint32(data[5:9])
+		if typeCode != 1 {
+			return "", fmt.Errorf("not a point type: %d", typeCode)
+		}
+		xBits := binary.LittleEndian.Uint64(data[9:17])
+		yBits := binary.LittleEndian.Uint64(data[17:25])
+		x = math.Float64frombits(xBits)
+		y = math.Float64frombits(yBits)
+	} else { // Big Endian
+		// Check type (Point = 1)
+		typeCode := binary.BigEndian.Uint32(data[5:9])
+		if typeCode != 1 {
+			return "", fmt.Errorf("not a point type: %d", typeCode)
+		}
+		xBits := binary.BigEndian.Uint64(data[9:17])
+		yBits := binary.BigEndian.Uint64(data[17:25])
+		x = math.Float64frombits(xBits)
+		y = math.Float64frombits(yBits)
+	}
+
+	// 格式化为PostgreSQL Point格式 (x,y)
+	return fmt.Sprintf("(%v,%v)", x, y), nil
+}
